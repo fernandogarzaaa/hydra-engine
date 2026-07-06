@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     CONTEXT_TOKEN_THRESHOLD: int = Field(default=4000, gt=0)
     REDIS_QUEUE_NAME: str = Field(default="hydra:workflow:queue")
     REDIS_DELAYED_QUEUE_NAME: str = Field(default="hydra:workflow:delayed")
+    HYDRA_USE_GATEWAY_MODEL: bool = Field(default=False)
+    HYDRA_GATEWAY_URL: str = Field(default="http://async_mcp_gateway:8080/v1/chat/completions")
+    HYDRA_GATEWAY_TENANT_ID: str = Field(default="tenant-alpha")
+    HYDRA_GATEWAY_BEARER_TOKEN: str = Field(default="alpha-secret-token")
+    HYDRA_GATEWAY_MODEL: str = Field(default="gpt-4o-mini")
 
 
 @lru_cache(maxsize=1)

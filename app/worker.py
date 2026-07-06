@@ -11,7 +11,10 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, Protocol, cast
 
+import httpx
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -56,6 +59,8 @@ async def default_tool_executor(
     if payload.get("force_error") is True:
         message = str(payload.get("error_message", "forced step failure"))
         raise RuntimeError(message)
+    if settings.HYDRA_USE_GATEWAY_MODEL and "prompt" in payload:
+        return await _execute_gateway_prompt(payload, replay_state)
     return {
         "step_id": str(step.id),
         "step_number": step.step_number,
@@ -63,6 +68,55 @@ async def default_tool_executor(
         "input": payload,
         "replay_state_size": len(replay_state),
     }
+
+
+async def _execute_gateway_prompt(
+    payload: dict[str, Any],
+    replay_state: list[dict[str, Any]],
+) -> dict[str, Any]:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the execution planner inside Hydra Engine. "
+                "Return concise JSON-like text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": str(payload["prompt"]),
+        },
+    ]
+    if replay_state:
+        messages.insert(
+            1,
+            {
+                "role": "system",
+                "content": f"Replay state: {json.dumps(replay_state, default=str)}",
+            },
+        )
+    headers = {
+        "X-Tenant-ID": settings.HYDRA_GATEWAY_TENANT_ID,
+        "Authorization": f"Bearer {settings.HYDRA_GATEWAY_BEARER_TOKEN}",
+    }
+    request_payload = {
+        "model": str(payload.get("model") or settings.HYDRA_GATEWAY_MODEL),
+        "messages": messages,
+        "temperature": float(payload.get("temperature", 0.2)),
+        "max_tokens": int(payload.get("max_tokens", 512)),
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            settings.HYDRA_GATEWAY_URL,
+            json=request_payload,
+            headers=headers,
+        )
+        response.raise_for_status()
+        return {
+            "gateway_url": settings.HYDRA_GATEWAY_URL,
+            "model": request_payload["model"],
+            "response": response.json(),
+        }
 
 
 def make_redis_client(redis_url: str | None = None) -> Redis:
@@ -177,7 +231,14 @@ async def run_worker_forever(
         redis_client if redis_client is not None else cast(RedisQueueClient, make_redis_client())
     )
     while True:
-        item = await queue.brpop(settings.REDIS_QUEUE_NAME, poll_timeout_seconds)
+        try:
+            item = await queue.brpop(settings.REDIS_QUEUE_NAME, poll_timeout_seconds)
+        except RedisTimeoutError:
+            continue
+        except RedisError:
+            logger.exception("redis_queue_poll_failed")
+            await asyncio.sleep(1.0)
+            continue
         if item is None:
             continue
         raw_payload = _extract_brpop_payload(item)
