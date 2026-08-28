@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,8 +40,25 @@ class Settings(BaseSettings):
     HYDRA_USE_GATEWAY_MODEL: bool = Field(default=False)
     HYDRA_GATEWAY_URL: str = Field(default="http://async_mcp_gateway:8080/v1/chat/completions")
     HYDRA_GATEWAY_TENANT_ID: str = Field(default="tenant-alpha")
-    HYDRA_GATEWAY_BEARER_TOKEN: str = Field(default="alpha-secret-token")
+    HYDRA_GATEWAY_BEARER_TOKEN: str = Field(
+        default="",
+        description=(
+            "Bearer token sent to async_mcp_gateway. Required (non-empty) only when "
+            "HYDRA_USE_GATEWAY_MODEL is enabled; left unset otherwise since gateway "
+            "calls never happen."
+        ),
+    )
     HYDRA_GATEWAY_MODEL: str = Field(default="gpt-4o-mini")
+
+    @model_validator(mode="after")
+    def _require_bearer_token_when_gateway_enabled(self) -> "Settings":
+        if self.HYDRA_USE_GATEWAY_MODEL and not self.HYDRA_GATEWAY_BEARER_TOKEN:
+            raise ValueError(
+                "HYDRA_GATEWAY_BEARER_TOKEN must be set when HYDRA_USE_GATEWAY_MODEL "
+                "is enabled — refusing to start with no credential for the gateway "
+                "call in app/worker.py."
+            )
+        return self
 
 
 @lru_cache(maxsize=1)
