@@ -10,10 +10,12 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.database import Base
+from app.database import Base, get_db
+from app.main import app
 from app.models import (
     ExecutionStep,
     StepStatus,
@@ -306,3 +308,56 @@ async def test_concurrent_process_trajectory_pulls_execute_each_step_exactly_onc
         StepStatus.COMPLETED.value,
     ]
     assert trajectory.status == WorkflowStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio()
+async def test_healthz_reports_ok_when_database_and_redis_are_reachable(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    monkeypatch.setattr("app.main.make_redis_client", lambda: AsyncMock())
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/healthz")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"status": "ok", "checks": {"database": "ok", "redis": "ok"}}
+
+
+@pytest.mark.asyncio()
+async def test_healthz_reports_degraded_when_redis_is_unreachable(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        async with session_factory() as session:
+            yield session
+
+    def broken_redis_client() -> AsyncMock:
+        client = AsyncMock()
+        client.ping.side_effect = ConnectionError("redis unreachable")
+        return client
+
+    app.dependency_overrides[get_db] = override_get_db
+    monkeypatch.setattr("app.main.make_redis_client", broken_redis_client)
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/healthz")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"status": "degraded", "checks": {"database": "ok", "redis": "error"}}

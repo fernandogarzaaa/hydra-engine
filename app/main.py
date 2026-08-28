@@ -63,6 +63,13 @@ class WorkflowAuditResponse(BaseModel):
     timeline: list[StepAuditResponse]
 
 
+class HealthResponse(BaseModel):
+    """Liveness/readiness response for the health check endpoint."""
+
+    status: str
+    checks: dict[str, str]
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> Any:
     """Create database metadata during application startup."""
@@ -78,6 +85,31 @@ app = FastAPI(
     description="Fault-tolerant message-driven agent workflow engine.",
     lifespan=lifespan,
 )
+
+
+@app.get("/healthz", response_model=HealthResponse)
+async def healthz(db: DbSession) -> HealthResponse:
+    """Report liveness and cheap connectivity to the app's Postgres and Redis dependencies."""
+
+    checks: dict[str, str] = {}
+
+    try:
+        await db.execute(select(1))
+        checks["database"] = "ok"
+    except Exception:
+        checks["database"] = "error"
+
+    redis_client = make_redis_client()
+    try:
+        await redis_client.ping()
+        checks["redis"] = "ok"
+    except Exception:
+        checks["redis"] = "error"
+    finally:
+        await redis_client.aclose()
+
+    overall_status = "ok" if all(value == "ok" for value in checks.values()) else "degraded"
+    return HealthResponse(status=overall_status, checks=checks)
 
 
 @app.post(
