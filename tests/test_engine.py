@@ -361,3 +361,27 @@ async def test_healthz_reports_degraded_when_redis_is_unreachable(
     assert response.status_code == 200
     body = response.json()
     assert body == {"status": "degraded", "checks": {"database": "ok", "redis": "error"}}
+
+
+def test_settings_rejects_missing_bearer_token_when_gateway_model_enabled() -> None:
+    from app.config import Settings
+
+    with pytest.raises(ValueError, match="HYDRA_GATEWAY_BEARER_TOKEN must be set"):
+        Settings(HYDRA_USE_GATEWAY_MODEL=True, HYDRA_GATEWAY_BEARER_TOKEN="")
+
+
+def test_settings_allows_missing_bearer_token_when_gateway_model_disabled() -> None:
+    from app.config import Settings
+
+    settings = Settings(HYDRA_USE_GATEWAY_MODEL=False, HYDRA_GATEWAY_BEARER_TOKEN="")
+    assert settings.HYDRA_GATEWAY_BEARER_TOKEN == ""
+
+
+def test_settings_accepts_bearer_token_when_gateway_model_enabled() -> None:
+    from app.config import Settings
+
+    settings = Settings(
+        HYDRA_USE_GATEWAY_MODEL=True,
+        HYDRA_GATEWAY_BEARER_TOKEN="real-token",  # noqa: S106 - test fixture, not a real secret
+    )
+    assert settings.HYDRA_GATEWAY_BEARER_TOKEN == "real-token"  # noqa: S105
