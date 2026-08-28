@@ -114,6 +114,13 @@ class WorkflowTrajectory(Base):
         onupdate=utc_now,
         nullable=False,
     )
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
 
     steps: Mapped[list[ExecutionStep]] = relationship(
         "ExecutionStep",

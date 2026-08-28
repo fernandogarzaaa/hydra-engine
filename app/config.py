@@ -25,6 +25,14 @@ class Settings(BaseSettings):
         description="Redis URL used for durable task queueing.",
     )
     MAX_STEP_RETRIES: int = Field(default=3, ge=0)
+    TRAJECTORY_LEASE_SECONDS: float = Field(
+        default=120.0,
+        gt=0.0,
+        description=(
+            "How long a worker's claim on a trajectory is valid before another "
+            "worker may consider it abandoned and reclaim it."
+        ),
+    )
     BACKOFF_FACTOR: float = Field(default=2.0, gt=0.0)
     CONTEXT_TOKEN_THRESHOLD: int = Field(default=4000, gt=0)
     REDIS_QUEUE_NAME: str = Field(default="hydra:workflow:queue")
