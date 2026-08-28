@@ -5,22 +5,31 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
+from datetime import timedelta
 from typing import Any, Protocol, cast
 
 import httpx
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
-from sqlalchemy import select
+from sqlalchemy import CursorResult, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.database import AsyncSessionFactory
-from app.models import ExecutionStep, StepStatus, StepType, WorkflowStatus, WorkflowTrajectory
+from app.models import (
+    ExecutionStep,
+    StepStatus,
+    StepType,
+    WorkflowStatus,
+    WorkflowTrajectory,
+    utc_now,
+)
 
 logger = logging.getLogger("hydra_engine.worker")
 RedisValue = bytes | bytearray | memoryview | str | int | float
@@ -145,27 +154,52 @@ async def enqueue_trajectory(
     logger.info("trajectory_queued", extra={"trajectory_id": str(trajectory_id)})
 
 
+def _default_worker_id() -> str:
+    """Build a reasonably unique identifier for this worker process."""
+
+    return f"{socket.gethostname()}:{uuid.uuid4()}"
+
+
 async def process_trajectory(
     trajectory_id: str,
     *,
     session_factory: async_sessionmaker[AsyncSession] = AsyncSessionFactory,
     redis_client: RedisQueueClient | None = None,
     tool_executor: ToolExecutor = default_tool_executor,
+    worker_id: str | None = None,
 ) -> None:
-    """Replay and process a workflow trajectory from durable state."""
+    """Replay and process a workflow trajectory from durable state.
+
+    Before doing any work, the trajectory is atomically claimed via a single
+    ``UPDATE ... WHERE`` statement so that when two worker processes poll the
+    same trajectory concurrently, only one of them wins the claim and
+    proceeds; the other observes zero rows affected and returns immediately
+    without executing (and thus without double-executing) any steps.
+    """
 
     queue: RedisQueueClient = (
         redis_client if redis_client is not None else cast(RedisQueueClient, make_redis_client())
     )
+    resolved_worker_id = worker_id or _default_worker_id()
     parsed_trajectory_id = uuid.UUID(trajectory_id)
     async with session_factory() as session:
+        claimed = await _claim_trajectory(
+            session,
+            parsed_trajectory_id,
+            worker_id=resolved_worker_id,
+            lease_seconds=settings.TRAJECTORY_LEASE_SECONDS,
+        )
+        if not claimed:
+            logger.info(
+                "trajectory_claim_lost",
+                extra={"trajectory_id": trajectory_id, "worker_id": resolved_worker_id},
+            )
+            return
+
         trajectory = await _load_trajectory(session, parsed_trajectory_id)
         if trajectory is None:
             logger.warning("trajectory_not_found", extra={"trajectory_id": trajectory_id})
             return
-
-        trajectory.status = WorkflowStatus.RUNNING.value
-        await session.commit()
 
         steps = await _load_steps(session, parsed_trajectory_id)
         replay_state: list[dict[str, Any]] = []
@@ -249,6 +283,49 @@ async def run_worker_forever(
             redis_client=queue,
             tool_executor=tool_executor,
         )
+
+
+async def _claim_trajectory(
+    session: AsyncSession,
+    trajectory_id: uuid.UUID,
+    *,
+    worker_id: str,
+    lease_seconds: float,
+) -> bool:
+    """Atomically claim a trajectory for exclusive processing by this worker.
+
+    This closes a concurrency gap where two worker processes could both pull
+    the same pending trajectory and double-execute its steps: the claim is a
+    single ``UPDATE ... WHERE`` statement whose ``WHERE`` clause only matches
+    a row that is unclaimed, or whose previous lease has expired (e.g. the
+    worker holding it crashed). The database guarantees that at most one
+    concurrent transaction can update a given row, so at most one caller can
+    ever observe ``rowcount == 1`` for the same trajectory and lease window;
+    every other concurrent caller observes ``rowcount == 0`` and must not
+    proceed.
+    """
+
+    now = utc_now()
+    stmt = (
+        update(WorkflowTrajectory)
+        .where(
+            WorkflowTrajectory.id == trajectory_id,
+            WorkflowTrajectory.status != WorkflowStatus.COMPLETED.value,
+            or_(
+                WorkflowTrajectory.lease_expires_at.is_(None),
+                WorkflowTrajectory.lease_expires_at < now,
+            ),
+        )
+        .values(
+            status=WorkflowStatus.RUNNING.value,
+            claimed_by=worker_id,
+            claimed_at=now,
+            lease_expires_at=now + timedelta(seconds=lease_seconds),
+        )
+    )
+    result = cast(CursorResult[Any], await session.execute(stmt))
+    await session.commit()
+    return bool(result.rowcount == 1)
 
 
 async def _load_trajectory(
