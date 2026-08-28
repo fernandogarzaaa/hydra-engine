@@ -78,8 +78,7 @@ async def _execute_gateway_prompt(
         {
             "role": "system",
             "content": (
-                "You are the execution planner inside Hydra Engine. "
-                "Return concise JSON-like text."
+                "You are the execution planner inside Hydra Engine. Return concise JSON-like text."
             ),
         },
         {

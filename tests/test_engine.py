@@ -46,9 +46,7 @@ async def create_trajectory(
                     trajectory_id=trajectory_id,
                     step_number=step_number,
                     step_type=(
-                        StepType.TOOL_CALL.value
-                        if step_number == 3
-                        else StepType.LLM_THOUGHT.value
+                        StepType.TOOL_CALL.value if step_number == 3 else StepType.LLM_THOUGHT.value
                     ),
                     input_payload={"step": step_number},
                     output_payload={"already_done": step_number} if completed else None,
