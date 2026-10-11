@@ -12,3 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependabot for uv and GitHub Actions (weekly)
 - .env.example listing the environment settings read by app/config.py
 - SECURITY.md and this CHANGELOG
+- README "Getting started": install, configuration, running the API and
+  worker, triggering a workflow, and the check commands (from wave-3
+  dogfood; the README previously had no install/usage docs)
