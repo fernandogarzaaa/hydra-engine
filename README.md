@@ -6,12 +6,13 @@
 
 ## Getting started
 
-Requires Python 3.11+, PostgreSQL, and Redis. (The test suite runs on SQLite via the `dev` group — no external services needed for tests.)
+Requires Python 3.11-3.13, PostgreSQL, and Redis. (The test suite runs on SQLite via the `dev` group — no external services needed for tests.)
 
 ```bash
 # install (uv is the pinned path; plain pip works too)
 uv sync --group dev
-# or: pip install -e . && pip install aiosqlite pytest pytest-asyncio
+# or: pip install -e . "sqlalchemy[asyncio]<2.1" aiosqlite pytest pytest-asyncio ruff mypy
+# (the <2.1 pin keeps the sqlalchemy mypy plugin that `mypy app` expects)
 
 # configure
 cp .env.example .env   # then edit DATABASE_URL / REDIS_URL as needed
