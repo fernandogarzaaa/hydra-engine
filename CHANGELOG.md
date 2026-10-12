@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-13
+
+First tagged release.
+
+### Fixed
+
+- Failed steps are actually retried: the worker loop promotes due entries from the
+  delayed sorted set back onto the work queue (previously retries were written to a
+  set nothing read, so a failed step stayed PENDING forever).
+- Claim leases are released on completion, retry and permanent failure, and renewed
+  by a heartbeat while a step runs, so long steps are not reclaimed and run twice.
+- A retry/resume that arrives while another worker holds the lease is re-parked until
+  the lease ends instead of being dropped.
+- Malformed queue messages go to a dead-letter list and processing errors are logged;
+  neither stops the worker loop.
+
+### Security
+
+- Optional `HYDRA_API_KEY` authentication for the HTTP API.
+
 ### Added
+
+- Tests for retry promotion, lease release/heartbeat, early-retry parking, dead letter,
+  resume budget and API-key auth (fakeredis).
 
 - Dependabot for uv and GitHub Actions (weekly)
 - .env.example listing the environment settings read by app/config.py
