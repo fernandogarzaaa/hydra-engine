@@ -18,6 +18,10 @@ uv sync --group dev
 cp .env.example .env   # then edit DATABASE_URL / REDIS_URL as needed
 ```
 
+### Authentication
+
+Set `HYDRA_API_KEY` to require a key on every workflow route (`/workflows/trigger`, `/workflows/{id}/resume`, `/workflows/{id}/audit`). Send it as `X-API-Key: <key>` or `Authorization: Bearer <key>`; wrong or missing keys get `401`. `/healthz` stays open. When the variable is unset the API is unauthenticated (fine for local use) and logs a warning at startup, so keep uvicorn on its default `127.0.0.1` bind or put it behind your own auth. `tenant_id` is still client-supplied: the key gates access, it does not isolate tenants from each other.
+
 Run the API and the worker (two terminals):
 
 ```bash
@@ -34,6 +38,15 @@ curl -s -X POST localhost:8081/workflows/trigger \
 # -> {"id":"<uuid>",...}
 curl -s localhost:8081/workflows/<uuid>/audit | python3 -m json.tool
 ```
+
+## Failure model
+
+- **Claims and leases.** A worker claims a trajectory with one atomic `UPDATE ... WHERE` (unclaimed, or lease expired). While a step runs, a heartbeat renews the lease every `TRAJECTORY_LEASE_SECONDS / 3`, so a long step is not reclaimed by another worker. The lease is released when the trajectory completes, when a step fails and a retry is scheduled, and when it fails permanently.
+- **Retries.** A failed step is retried after `BACKOFF_FACTOR ** retry_count` seconds, up to `MAX_STEP_RETRIES`. Retries wait in a Redis sorted set (`REDIS_DELAYED_QUEUE_NAME`); every worker loop moves due entries back to the work queue (at most every `DELAYED_POLL_SECONDS`), and only the worker whose `ZREM` removed an entry re-queues it, so each retry is delivered once.
+- **Messages that arrive early.** If a retry or resume message arrives while another worker still holds the lease, it is parked on the delayed set until that lease ends instead of being dropped.
+- **Bad messages.** A malformed queue message is pushed to `REDIS_DEAD_LETTER_QUEUE_NAME` (default `hydra:workflow:dead`) and logged; an exception while processing a trajectory is logged. Neither stops the worker loop.
+- **Resume.** `/workflows/{id}/resume` resets failed steps to pending with a fresh retry budget.
+- **Limits.** The schema is created with `create_all` at startup (no migrations yet). The tests use SQLite and fakeredis; there is no multi-worker integration test against real Postgres/Redis yet.
 
 Run the checks:
 

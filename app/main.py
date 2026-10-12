@@ -2,20 +2,48 @@
 
 from __future__ import annotations
 
+import hmac
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any, cast
 
-from fastapi import Depends, FastAPI, HTTPException, Path, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import Base, engine, get_db
 from app.models import ExecutionStep, StepStatus, WorkflowStatus, WorkflowTrajectory
 from app.worker import RedisQueueClient, build_default_steps, enqueue_trajectory, make_redis_client
 
+logger = logging.getLogger("hydra_engine.api")
+
+
+async def require_api_key(
+    x_api_key: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    """Optional API-key auth. Off when HYDRA_API_KEY is unset (local/dev use);
+    when set, every workflow route needs the key via X-API-Key or Bearer."""
+
+    expected = settings.HYDRA_API_KEY
+    if not expected:
+        return
+    supplied = x_api_key or ""
+    if not supplied and authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    if not supplied or not hmac.compare_digest(supplied.encode(), expected.encode()):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+ApiKey = Depends(require_api_key)
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 WorkflowIdPath = Annotated[uuid.UUID, Path(description="Workflow trajectory identifier.")]
 
@@ -74,6 +102,11 @@ class HealthResponse(BaseModel):
 async def lifespan(_: FastAPI) -> Any:
     """Create database metadata during application startup."""
 
+    if not settings.HYDRA_API_KEY:
+        logger.warning(
+            "HYDRA_API_KEY is not set: the workflow API is unauthenticated. "
+            "Bind to 127.0.0.1 (uvicorn's default) or set HYDRA_API_KEY."
+        )
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     yield
@@ -116,6 +149,7 @@ async def healthz(db: DbSession) -> HealthResponse:
     "/workflows/trigger",
     response_model=WorkflowResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[ApiKey],
 )
 async def trigger_workflow(
     request: TriggerWorkflowRequest,
@@ -146,6 +180,7 @@ async def trigger_workflow(
     "/workflows/{id}/resume",
     response_model=WorkflowResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[ApiKey],
 )
 async def resume_workflow(
     id: WorkflowIdPath,
@@ -162,6 +197,10 @@ async def resume_workflow(
         if reset_started:
             step.status = StepStatus.PENDING.value
             step.error_log = None
+            # A resume is an explicit operator decision to try again: give the
+            # step a fresh retry budget, otherwise an exhausted step fails again
+            # immediately without running.
+            step.retry_count = 0
 
     trajectory.status = WorkflowStatus.PENDING.value
     await db.commit()
@@ -174,7 +213,11 @@ async def resume_workflow(
     return WorkflowResponse.model_validate(trajectory, from_attributes=True)
 
 
-@app.get("/workflows/{id}/audit", response_model=WorkflowAuditResponse)
+@app.get(
+    "/workflows/{id}/audit",
+    response_model=WorkflowAuditResponse,
+    dependencies=[ApiKey],
+)
 async def audit_workflow(
     id: WorkflowIdPath,
     db: DbSession,

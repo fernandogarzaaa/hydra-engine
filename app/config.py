@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     CONTEXT_TOKEN_THRESHOLD: int = Field(default=4000, gt=0)
     REDIS_QUEUE_NAME: str = Field(default="hydra:workflow:queue")
     REDIS_DELAYED_QUEUE_NAME: str = Field(default="hydra:workflow:delayed")
+    REDIS_DEAD_LETTER_QUEUE_NAME: str = Field(default="hydra:workflow:dead")
+    DELAYED_POLL_SECONDS: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="How often (at most) the worker promotes due retries from the delayed set.",
+    )
+    HYDRA_API_KEY: str = Field(
+        default="",
+        description=(
+            "When set, every API route except /healthz requires this key in an "
+            "X-API-Key header or an 'Authorization: Bearer' header."
+        ),
+    )
     HYDRA_USE_GATEWAY_MODEL: bool = Field(default=False)
     HYDRA_GATEWAY_URL: str = Field(default="http://async_mcp_gateway:8080/v1/chat/completions")
     HYDRA_GATEWAY_TENANT_ID: str = Field(default="tenant-alpha")
