@@ -114,7 +114,7 @@ async def lifespan(_: FastAPI) -> Any:
 
 app = FastAPI(
     title="Hydra Engine",
-    version="0.1.0",
+    version="0.1.1",
     description="Fault-tolerant message-driven agent workflow engine.",
     lifespan=lifespan,
 )

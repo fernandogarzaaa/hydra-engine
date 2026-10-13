@@ -557,3 +557,90 @@ async def test_healthz_does_not_require_key(
 ) -> None:
     monkeypatch.setattr("app.main.settings.HYDRA_API_KEY", "s3cret")
     assert (await api.get("/healthz")).status_code == 200
+
+
+# --- lease fencing -------------------------------------------------------------
+
+
+async def _steal_lease(factory: async_sessionmaker[AsyncSession], tid: uuid.UUID) -> None:
+    """Simulate the lease expiring and another worker reclaiming the trajectory."""
+
+    async with factory() as other:
+        traj = (
+            await other.execute(select(WorkflowTrajectory).where(WorkflowTrajectory.id == tid))
+        ).scalar_one()
+        traj.claimed_by = "worker-b"
+        traj.lease_expires_at = utc_now() + timedelta(seconds=300)
+        await other.commit()
+
+
+@pytest.mark.asyncio()
+async def test_step_output_discarded_when_lease_lost_mid_step(
+    session_factory: async_sessionmaker[AsyncSession], redis: fakeredis.FakeAsyncRedis
+) -> None:
+    tid = await _make_trajectory(session_factory, steps=2)
+    calls: list[int] = []
+
+    async def slow_then_stolen(step: ExecutionStep, _r: list[dict[str, Any]]) -> dict[str, Any]:
+        calls.append(step.step_number)
+        await _steal_lease(session_factory, tid)
+        return {"n": step.step_number}
+
+    await process_trajectory(
+        str(tid),
+        session_factory=session_factory,
+        redis_client=redis,
+        tool_executor=slow_then_stolen,
+        worker_id="worker-a",
+    )
+    traj, steps = await _load(session_factory, tid)
+    assert calls == [1], "worker-a must stop after losing the lease"
+    assert traj.claimed_by == "worker-b", "the new holder's claim must not be cleared"
+    assert traj.status != WorkflowStatus.COMPLETED.value
+    assert [s.status for s in steps] == [StepStatus.PENDING.value] * 2
+
+
+@pytest.mark.asyncio()
+async def test_failure_not_recorded_when_lease_lost_mid_step(
+    session_factory: async_sessionmaker[AsyncSession], redis: fakeredis.FakeAsyncRedis
+) -> None:
+    tid = await _make_trajectory(session_factory, steps=1)
+
+    async def stolen_then_fail(step: ExecutionStep, _r: list[dict[str, Any]]) -> dict[str, Any]:
+        await _steal_lease(session_factory, tid)
+        raise RuntimeError("boom")
+
+    await process_trajectory(
+        str(tid),
+        session_factory=session_factory,
+        redis_client=redis,
+        tool_executor=stolen_then_fail,
+        worker_id="worker-a",
+    )
+    traj, steps = await _load(session_factory, tid)
+    assert traj.claimed_by == "worker-b"
+    assert steps[0].retry_count == 0
+    assert steps[0].status == StepStatus.PENDING.value
+    assert await redis.zcard(DELAYED) == 0, "no retry may be scheduled by the old holder"
+
+
+@pytest.mark.asyncio()
+async def test_owner_still_completes_normally_with_fencing(
+    session_factory: async_sessionmaker[AsyncSession], redis: fakeredis.FakeAsyncRedis
+) -> None:
+    tid = await _make_trajectory(session_factory, steps=3)
+
+    async def ok(step: ExecutionStep, _r: list[dict[str, Any]]) -> dict[str, Any]:
+        return {"n": step.step_number}
+
+    await process_trajectory(
+        str(tid),
+        session_factory=session_factory,
+        redis_client=redis,
+        tool_executor=ok,
+        worker_id="worker-a",
+    )
+    traj, steps = await _load(session_factory, tid)
+    assert traj.status == WorkflowStatus.COMPLETED.value
+    assert traj.claimed_by is None
+    assert [s.status for s in steps] == [StepStatus.COMPLETED.value] * 3

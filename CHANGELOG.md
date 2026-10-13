@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-13
+
+### Fixed
+
+- Lease fencing: a worker whose lease expired mid-step (for example a stalled
+  heartbeat) and was reclaimed by another worker no longer commits that step's
+  output, marks the trajectory completed, records a failure/retry, or clears the
+  new holder's claim. Every write now re-asserts ownership with a conditional
+  `UPDATE ... WHERE claimed_by = <worker>` in the same transaction and rolls back
+  if the claim moved, so a step is not recorded twice and two workers do not race
+  through the remaining steps.
+
 ## [0.1.0] - 2026-10-13
 
 First tagged release.
