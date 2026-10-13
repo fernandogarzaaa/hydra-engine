@@ -264,6 +264,11 @@ async def process_trajectory(
             if step.retry_count >= settings.MAX_STEP_RETRIES:
                 step.status = StepStatus.FAILED.value
                 trajectory.status = WorkflowStatus.FAILED.value
+                if not await _confirm_ownership(session, parsed_trajectory_id, resolved_worker_id):
+                    await _abandon_lost_lease(
+                        session, parsed_trajectory_id, resolved_worker_id, "retry_limit"
+                    )
+                    return
                 _clear_lease(trajectory)
                 await session.commit()
                 logger.error(
@@ -278,7 +283,9 @@ async def process_trajectory(
                 ):
                     output_payload = await tool_executor(step, replay_state)
             except Exception:
-                await _record_step_failure(session, trajectory, step, queue)
+                await _record_step_failure(
+                    session, trajectory, step, queue, worker_id=resolved_worker_id
+                )
                 return
 
             step.output_payload = output_payload
@@ -291,9 +298,20 @@ async def process_trajectory(
                     "output_payload": output_payload,
                 }
             )
+            if not await _confirm_ownership(session, parsed_trajectory_id, resolved_worker_id):
+                # Another worker owns the trajectory now; it will (re)run this
+                # step. Committing here would record a second execution and
+                # let both workers race through the remaining steps.
+                await _abandon_lost_lease(
+                    session, parsed_trajectory_id, resolved_worker_id, "step_commit"
+                )
+                return
             await session.commit()
 
         trajectory.status = WorkflowStatus.COMPLETED.value
+        if not await _confirm_ownership(session, parsed_trajectory_id, resolved_worker_id):
+            await _abandon_lost_lease(session, parsed_trajectory_id, resolved_worker_id, "complete")
+            return
         _clear_lease(trajectory)
         await session.commit()
         logger.info("trajectory_completed", extra={"trajectory_id": trajectory_id})
@@ -471,6 +489,44 @@ async def _requeue_if_leased_elsewhere(
     await enqueue_trajectory(queue, trajectory_id, delay_seconds=delay)
 
 
+async def _confirm_ownership(
+    session: AsyncSession,
+    trajectory_id: uuid.UUID,
+    worker_id: str,
+) -> bool:
+    """Fence a write: re-assert this worker's claim inside the caller's transaction.
+
+    A conditional ``UPDATE`` (only while ``claimed_by`` is still this worker)
+    that also extends the lease. On PostgreSQL it takes the row lock, so a
+    concurrent reclaim waits for this transaction and then sees the fresh
+    lease. If it matches no row the lease was lost (expired and reclaimed by
+    another worker, or reset): the caller must roll back instead of committing
+    step output or overwriting the new holder's claim.
+    """
+
+    stmt = (
+        update(WorkflowTrajectory)
+        .where(
+            WorkflowTrajectory.id == trajectory_id,
+            WorkflowTrajectory.claimed_by == worker_id,
+        )
+        .values(lease_expires_at=utc_now() + timedelta(seconds=settings.TRAJECTORY_LEASE_SECONDS))
+        .execution_options(synchronize_session=False)
+    )
+    result = cast(CursorResult[Any], await session.execute(stmt))
+    return bool(result.rowcount == 1)
+
+
+async def _abandon_lost_lease(
+    session: AsyncSession, trajectory_id: uuid.UUID, worker_id: str, where: str
+) -> None:
+    await session.rollback()
+    logger.warning(
+        "lease_lost_write_discarded",
+        extra={"trajectory_id": str(trajectory_id), "worker_id": worker_id, "at": where},
+    )
+
+
 async def _claim_trajectory(
     session: AsyncSession,
     trajectory_id: uuid.UUID,
@@ -552,10 +608,17 @@ async def _record_step_failure(
     trajectory: WorkflowTrajectory,
     step: ExecutionStep,
     queue: RedisQueueClient,
+    *,
+    worker_id: str,
 ) -> None:
     step.retry_count += 1
     step.status = StepStatus.FAILED.value
     step.error_log = traceback.format_exc()
+    if not await _confirm_ownership(session, trajectory.id, worker_id):
+        # The lease moved to another worker mid-step; its run owns the retry
+        # budget and the status. Do not overwrite them or schedule a retry.
+        await _abandon_lost_lease(session, trajectory.id, worker_id, "step_failure")
+        return
 
     if step.retry_count >= settings.MAX_STEP_RETRIES:
         trajectory.status = WorkflowStatus.FAILED.value
